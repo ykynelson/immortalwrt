@@ -27,15 +27,15 @@ jobs:
       run: |
         # workflow里可以直接创建config文件
         echo "CONFIG_TARGET_x86=y
-CONFIG_TARGET_x86_64=y
-CONFIG_TARGET_x86_64_Generic=y
-CONFIG_EFI_IMAGES=n
-CONFIG_PACKAGE_luci-app-openclash=y
-CONFIG_PACKAGE_luci-app-passwall=y
-CONFIG_PACKAGE_samba4-server=y
-CONFIG_PACKAGE_curl=y
-CONFIG_PACKAGE_wget=y
-CONFIG_PACKAGE_nano=y" > .config
+        CONFIG_TARGET_x86_64=y
+        CONFIG_TARGET_x86_64_Generic=y
+        CONFIG_EFI_IMAGES=n
+        CONFIG_PACKAGE_luci-app-openclash=y
+        CONFIG_PACKAGE_luci-app-passwall=y
+        CONFIG_PACKAGE_samba4-server=y
+        CONFIG_PACKAGE_curl=y
+        CONFIG_PACKAGE_wget=y
+        CONFIG_PACKAGE_nano=y" > .config
         make defconfig
 
     - name: Build firmware
