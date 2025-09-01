@@ -1,21 +1,25 @@
-name: Build OpenWrt
+name: Build OpenWrt x86_64 VHD
 
 on:
   workflow_dispatch:
 
 jobs:
-  build-v1:
+  build:
     runs-on: ubuntu-22.04
+
     steps:
       - name: Checkout
         uses: actions/checkout@v3
 
       - name: Install dependencies
         run: |
-          sudo apt update
-          sudo apt install -y build-essential clang flex bison g++ gawk gcc-multilib \
-            gettext git libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev \
-            file wget curl qemu-utils
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential ccache ecj fastjar file g++ gawk \
+            gettext git java-propose-classpath libelf-dev \
+            libncurses5-dev libncursesw5-dev libssl-dev python3 \
+            python3-distutils python3-setuptools qemu-utils \
+            subversion swig unzip wget zlib1g-dev
 
       - name: Clone OpenWrt
         run: |
@@ -24,7 +28,7 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Generate config
+      - name: Generate .config
         run: |
           cd openwrt
           echo "CONFIG_TARGET_x86=y
@@ -37,69 +41,24 @@ jobs:
           CONFIG_PACKAGE_curl=y
           CONFIG_PACKAGE_wget=y
           CONFIG_PACKAGE_nano=y" > .config
-          make defconfig
 
       - name: Build OpenWrt
         run: |
           cd openwrt
-          make -j$(nproc) || make -j1 V=s
-
-      - name: Upload artifacts (V1)
-        uses: actions/upload-artifact@v3
-        with:
-          name: openwrt-bin
-          path: openwrt/bin/targets/x86/64/*
-
-  build-v2:
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y build-essential clang flex bison g++ gawk gcc-multilib \
-            gettext git libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev \
-            file wget curl qemu-utils
-
-      - name: Clone OpenWrt
-        run: |
-          git clone https://github.com/openwrt/openwrt.git
-          cd openwrt
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
-
-      - name: Generate config
-        run: |
-          cd openwrt
-          echo "CONFIG_TARGET_x86=y
-          CONFIG_TARGET_x86_64=y
-          CONFIG_TARGET_x86_64_Generic=y
-          CONFIG_EFI_IMAGES=n
-          CONFIG_PACKAGE_luci-app-openclash=y
-          CONFIG_PACKAGE_luci-app-passwall=y
-          CONFIG_PACKAGE_samba4-server=y
-          CONFIG_PACKAGE_curl=y
-          CONFIG_PACKAGE_wget=y
-          CONFIG_PACKAGE_nano=y" > .config
           make defconfig
-
-      - name: Build OpenWrt
-        run: |
-          cd openwrt
+          make -j$(nproc) download
           make -j$(nproc) || make -j1 V=s
 
       - name: Convert to VHD
         run: |
           mkdir -p output
           cd openwrt/bin/targets/x86/64/
-          RAW_IMG=$(ls openwrt-*-squashfs-combined.img.gz | head -n 1 | sed 's/.gz//')
-          gunzip -c ${RAW_IMG}.gz > ${RAW_IMG}
+          RAW_IMG=$(ls openwrt-*-combined.img.gz | sed 's/.gz//')
+          gunzip -c $RAW_IMG.gz > ${RAW_IMG}
           qemu-img convert -f raw -O vpc ${RAW_IMG} ../../../output/openwrt-x86-64.vhd
 
-      - name: Upload artifacts (V2)
+      - name: Upload Artifact
         uses: actions/upload-artifact@v3
         with:
-          name: openwrt-vhd
+          name: openwrt-x86-64-vhd
           path: output/openwrt-x86-64.vhd
