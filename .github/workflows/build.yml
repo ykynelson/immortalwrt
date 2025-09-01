@@ -1,0 +1,48 @@
+name: Build ImmortalWrt x86_64 HyperV
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout source
+      uses: actions/checkout@v3
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential libncurses5-dev zlib1g-dev gawk git gettext libssl-dev wget xsltproc unzip python3
+
+    - name: Update feeds
+      run: |
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Use preconfigured build
+      run: |
+        # workflow里可以直接创建config文件
+        echo "CONFIG_TARGET_x86=y
+CONFIG_TARGET_x86_64=y
+CONFIG_TARGET_x86_64_Generic=y
+CONFIG_EFI_IMAGES=n
+CONFIG_PACKAGE_luci-app-openclash=y
+CONFIG_PACKAGE_luci-app-passwall=y
+CONFIG_PACKAGE_samba4-server=y
+CONFIG_PACKAGE_curl=y
+CONFIG_PACKAGE_wget=y
+CONFIG_PACKAGE_nano=y" > .config
+        make defconfig
+
+    - name: Build firmware
+      run: |
+        make -j$(nproc) V=s
+
+    - name: Upload sysupgrade firmware
+      uses: softprops/action-gh-release@v1
+      with:
+        files: bin/targets/x86/64/openwrt-x86-64-generic-sysupgrade.bin
