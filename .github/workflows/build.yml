@@ -1,32 +1,45 @@
-name: Build ImmortalWrt x86_64 HyperV old VHD
+name: Build OpenWrt VHD (V3)
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-
+    runs-on: ubuntu-22.04
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: Free Disk Space
+        run: |
+          echo "=== Before cleanup ==="
+          df -h
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /opt/hostedtoolcache
+          sudo apt-get clean
+          echo "=== After cleanup ==="
+          df -h
+
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libncurses5-dev zlib1g-dev gawk git gettext libssl-dev wget xsltproc unzip python3 qemu-utils
+          sudo apt-get install -y build-essential ccache ecj fastjar file g++ gawk \
+            gettext git java-propose-classpath libelf-dev libncurses5-dev libncursesw5-dev \
+            libssl-dev python3 unzip wget python3-distutils python3-setuptools rsync qemu-utils
 
-      - name: Update feeds
+      - name: Clone OpenWrt
         run: |
+          git clone https://github.com/openwrt/openwrt.git
+          cd openwrt
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Configure firmware
+      - name: Generate custom .config
         run: |
-          # 直接在 workflow 里生成 .config
+          cd openwrt
           echo "CONFIG_TARGET_x86=y
           CONFIG_TARGET_x86_64=y
           CONFIG_TARGET_x86_64_Generic=y
@@ -39,16 +52,21 @@ jobs:
           CONFIG_PACKAGE_nano=y" > .config
           make defconfig
 
-      - name: Build firmware image
+      - name: Build OpenWrt (imagebuilder)
         run: |
-          make -j$(nproc) V=s DISK_IMG=y
+          cd openwrt
+          make -j$(nproc) || make -j1 V=s
 
-      - name: Convert IMG to VHD
+      - name: Convert to VHD
         run: |
-          qemu-img convert -f raw -O vpc bin/targets/x86/64/openwrt-x86-64-generic-ext4-combined.img openwrt-x86-64.vhd
+          mkdir -p output
+          cd openwrt/bin/targets/x86/64/
+          RAW_IMG=$(ls openwrt-*-generic-rootfs.img.gz | sed 's/.gz//')
+          gunzip -c $RAW_IMG.gz > ${RAW_IMG}
+          qemu-img convert -f raw -O vpc ${RAW_IMG} ../../../output/openwrt-x86-64.vhd
 
-      - name: Upload VHD artifact
-        uses: actions/upload-artifact@v3
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
         with:
           name: openwrt-vhd
-          path: openwrt-x86-64.vhd
+          path: openwrt/output/openwrt-x86-64.vhd
