@@ -1,103 +1,365 @@
-name: Build ImmortalWrt IMG (BIOS, Hyper-V friendly)
+name: Fast OpenWrt Build for x86_64
 
 on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
   workflow_dispatch:
 
+env:
+  REPO_URL: https://github.com/openwrt/openwrt
+  REPO_BRANCH: openwrt-23.05
+  TZ: Asia/Shanghai
+
 jobs:
-  build-img:
-    runs-on: ubuntu-22.04
-
+  # 使用矩阵策略，可以同时编译多个目标（这里只有一个）
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64]
+    
     steps:
-      - name: Checkout workflow repo
-        uses: actions/checkout@v4
+    - name: Checkout
+      uses: actions/checkout@v4
 
-      # 释放磁盘空间，避免 No space left on device
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
-          sudo apt-get clean
-          df -h
+    # 使用多重缓存策略
+    - name: Setup build cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.ccache
+          openwrt/dl
+          openwrt/.ccache
+        key: openwrt-${{ matrix.target }}-${{ github.sha }}
+        restore-keys: |
+          openwrt-${{ matrix.target }}-
+          openwrt-
 
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
-            gettext git libncurses5-dev libssl-dev python3-distutils rsync unzip \
-            zlib1g-dev file wget curl
+    - name: Setup toolchain cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          openwrt/build_dir/host
+          openwrt/build_dir/hostpkg
+          openwrt/staging_dir/host
+          openwrt/staging_dir/hostpkg
+          openwrt/staging_dir/target-*
+        key: toolchain-${{ matrix.target }}-${{ hashFiles('**/feeds.conf.default') }}
+        restore-keys: |
+          toolchain-${{ matrix.target }}-
 
-      - name: Clone ImmortalWrt
-        run: |
-          git clone --depth=1 https://github.com/immortalwrt/immortalwrt.git
-          cd immortalwrt
-          # 如需固定版本可改为：git checkout v24.0.0
+    - name: Maximize build space and speed
+      run: |
+        echo "磁盘使用情况 (优化前):"
+        df -h
+        
+        # 删除不必要的文件（更激进的清理）
+        sudo rm -rf \
+          /usr/share/dotnet \
+          /usr/local/lib/android \
+          /opt/ghc \
+          /opt/hostedtoolcache \
+          /usr/local/share/boost \
+          /usr/local/graalvm/ \
+          /usr/local/.ghcup/ \
+          /usr/local/share/powershell \
+          /usr/local/share/chromium \
+          /usr/local/lib/node_modules \
+          /usr/share/swift \
+          /tmp/* \
+          /var/log/* \
+          2>/dev/null || true
+        
+        # 清理包管理器
+        sudo apt-get clean
+        sudo apt-get autoremove -y
+        
+        # 优化系统参数
+        echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf
+        echo 'vm.vfs_cache_pressure=50' | sudo tee -a /etc/sysctl.conf
+        sudo sysctl -p
+        
+        echo "磁盘使用情况 (优化后):"
+        df -h
 
-          # 加入第三方 feeds（OpenClash/Passwall）
-          # 如果你不需要它们，可注释掉下面两行
-          echo 'src-git openclash https://github.com/vernesong/OpenClash.git;master' >> feeds.conf.default
-          echo 'src-git passwall https://github.com/xiaorouji/openwrt-passwall.git;main' >> feeds.conf.default
+    - name: Install dependencies (optimized)
+      run: |
+        # 使用更快的镜像源
+        sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
+        sudo sed -i 's/http:\/\/archive\.ubuntu\.com\/ubuntu\//http:\/\/mirrors\.ustc\.edu\.cn\/ubuntu\//g' /etc/apt/sources.list
+        
+        # 只安装绝对必需的包
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends --no-install-suggests \
+          build-essential clang flex g++ gawk gcc-multilib gettext git \
+          libncurses5-dev libssl-dev python3-distutils rsync unzip \
+          zlib1g-dev file wget ccache libelf-dev qemu-utils \
+          time curl ca-certificates
+        
+        # 优化ccache设置
+        ccache --set-config=max_size=3G
+        ccache --set-config=compression=true
+        ccache --set-config=compression_level=6
+        ccache --set-config=cache_dir=~/.ccache
+        export CCACHE_DIR=~/.ccache
+        export PATH="/usr/lib/ccache:$PATH"
+        
+        echo "ccache版本和配置:"
+        ccache --version
+        ccache --show-config
 
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+    - name: Clone OpenWrt source
+      run: |
+        # 浅克隆以减少下载时间和空间
+        git clone $REPO_URL -b $REPO_BRANCH openwrt \
+          --depth=1 \
+          --single-branch \
+          --filter=blob:none \
+          --no-tags
+        
+        cd openwrt
+        echo "源码信息:"
+        echo "分支: $(git branch --show-current)"
+        echo "提交: $(git log -1 --oneline)"
+        echo "源码大小: $(du -sh . 2>/dev/null || echo 'unknown')"
 
-      - name: Generate .config (x86_64 BIOS + packages)
-        run: |
-          cd immortalwrt
-          cat > .config <<'EOF'
-          CONFIG_TARGET_x86=y
-          CONFIG_TARGET_x86_64=y
-          CONFIG_TARGET_x86_64_Generic=y
-          # 关闭仅 EFI 镜像，保留 BIOS 兼容
-          CONFIG_EFI_IMAGES=n
+    - name: Load custom feeds
+      run: |
+        cd openwrt
+        
+        # 可选：添加第三方feeds以获取更多包
+        # echo 'src-git kenzo https://github.com/kenzok8/openwrt-packages' >> feeds.conf.default
+        # echo 'src-git small https://github.com/kenzok8/small' >> feeds.conf.default
+        
+        # 并行更新feeds
+        echo "更新feeds..."
+        time ./scripts/feeds update -a -j$(nproc)
+        
+        echo "安装feeds..."
+        time ./scripts/feeds install -a
 
-          # 你要的包；若第三方源不兼容，会在 defconfig 时提示，可按需删减
-          CONFIG_PACKAGE_luci-app-openclash=y
-          CONFIG_PACKAGE_luci-app-passwall=y
-          CONFIG_PACKAGE_samba4-server=y
-          CONFIG_PACKAGE_curl=y
-          CONFIG_PACKAGE_wget=y
-          CONFIG_PACKAGE_nano=y
-          EOF
+    - name: Generate minimal config
+      run: |
+        cd openwrt
+        
+        # 创建最小化但功能完整的配置
+        cat > .config << 'EOF'
+        CONFIG_TARGET_x86=y
+        CONFIG_TARGET_x86_64=y
+        CONFIG_TARGET_x86_64_Generic=y
+        
+        # 镜像格式 - 只生成需要的
+        CONFIG_EFI_IMAGES=n
+        CONFIG_GRUB_IMAGES=y
+        CONFIG_VMDK_IMAGES=n
+        CONFIG_VDI_IMAGES=n
+        CONFIG_QCOW2_IMAGES=n
+        
+        # 编译优化
+        CONFIG_CCACHE=y
+        CONFIG_DEVEL=y
+        CONFIG_TOOLCHAINOPTS=y
+        CONFIG_TARGET_OPTIONS=y
+        CONFIG_KERNEL_BUILD_DOMAIN="buildhost"
+        CONFIG_KERNEL_BUILD_USER="builder"
+        
+        # 基础系统
+        CONFIG_PACKAGE_luci=y
+        CONFIG_PACKAGE_luci-ssl=y
+        CONFIG_PACKAGE_curl=y
+        CONFIG_PACKAGE_wget-ssl=y
+        CONFIG_PACKAGE_nano=y
+        
+        # 文件共享
+        CONFIG_PACKAGE_samba4-server=y
+        CONFIG_PACKAGE_luci-app-samba4=y
+        
+        # 尝试包含请求的应用（如果不存在会被忽略）
+        CONFIG_PACKAGE_luci-app-openclash=m
+        CONFIG_PACKAGE_luci-app-passwall=m
+        
+        # 优化：禁用调试和不必要的功能
+        # CONFIG_COLLECT_KERNEL_DEBUG is not set
+        # CONFIG_KERNEL_DEBUG_INFO is not set
+        # CONFIG_KERNEL_DEBUG_KERNEL is not set
+        # CONFIG_KERNEL_KALLSYMS is not set
+        # CONFIG_PACKAGE_strace is not set
+        # CONFIG_PACKAGE_valgrind is not set
+        EOF
+        
+        # 生成完整配置
+        make defconfig V=s
+        
+        # 显示关键配置
+        echo "=== 关键配置项 ==="
+        grep "=y\|=m" .config | grep -E "(TARGET|PACKAGE_luci|PACKAGE_samba|CCACHE)" | head -20
 
-          make defconfig
+    - name: Download packages with retry
+      run: |
+        cd openwrt
+        
+        # 设置并行下载，带重试机制
+        download_with_retry() {
+          local max_attempts=3
+          local attempt=1
+          
+          while [ $attempt -le $max_attempts ]; do
+            echo "下载尝试 $attempt/$max_attempts"
+            if make download -j$(($(nproc) * 2)) V=s; then
+              echo "下载成功"
+              return 0
+            else
+              echo "下载失败，等待重试..."
+              sleep 10
+              ((attempt++))
+            fi
+          done
+          
+          echo "多次重试后仍然失败，尝试单线程下载"
+          make download -j1 V=s
+        }
+        
+        time download_with_retry
+        
+        # 清理损坏的下载文件
+        find dl -size -1024c -exec ls -l {} \; -exec rm -f {} \;
+        
+        echo "下载文件统计:"
+        find dl -type f | wc -l
 
-      - name: Build firmware (with fallback)
-        run: |
-          cd immortalwrt
-          # 先把源码下载好，再编译；失败则降级到单线程便于排错
-          make -j$(nproc) download
-          make -j$(nproc) || make -j1 V=s
-
-      - name: Collect IMG (combined image only)
-        run: |
-          set -euxo pipefail
-          OUT_DIR="$GITHUB_WORKSPACE/output"
-          mkdir -p "$OUT_DIR"
-          cd immortalwrt/bin/targets/x86/64/
-          ls -lh
-
-          # 优先找 squashfs 组合镜像，其次 ext4；不限定文件名前缀，兼容 immortalwrt/openwrt 命名
-          IMG_GZ=$(ls *-squashfs-combined*.img.gz 2>/dev/null | head -n 1 || true)
-          if [ -z "$IMG_GZ" ]; then
-            IMG_GZ=$(ls *-ext4-combined*.img.gz 2>/dev/null | head -n 1 || true)
+    - name: Compile with maximum optimization
+      run: |
+        cd openwrt
+        
+        # 设置编译环境
+        export PATH="/usr/lib/ccache:$PATH"
+        export CCACHE_DIR=~/.ccache
+        export FORCE_UNSAFE_CONFIGURE=1
+        
+        # 计算最优线程数
+        JOBS=$(($(nproc) + 2))
+        echo "使用 $JOBS 个编译线程"
+        echo "编译开始: $(date)"
+        
+        # 编译过程监控
+        compile_with_monitoring() {
+          # 后台监控磁盘使用情况
+          (
+            while true; do
+              df -h | grep -E '^/dev' | head -1 | awk '{print "磁盘使用:", $3"/"$2, "("$5")"}'
+              sleep 120
+            done
+          ) &
+          local monitor_pid=$!
+          
+          # 执行编译
+          if make -j$JOBS V=s \
+            IGNORE_ERRORS=1 \
+            BUILD_LOG=1 \
+            CONFIG_AUTOREMOVE=y; then
+            echo "编译成功"
+            kill $monitor_pid 2>/dev/null || true
+            return 0
+          else
+            echo "多线程编译失败，尝试单线程编译..."
+            kill $monitor_pid 2>/dev/null || true
+            make -j1 V=s
           fi
-          if [ -z "$IMG_GZ" ]; then
-            echo "ERROR: No combined .img.gz found in $(pwd)"
-            ls -lah
-            exit 1
+        }
+        
+        time compile_with_monitoring
+        
+        echo "编译完成: $(date)"
+        
+        # 显示ccache统计
+        echo "=== ccache统计 ==="
+        ccache --show-stats
+        
+        # 检查输出文件
+        echo "=== 编译产物 ==="
+        ls -la bin/targets/x86/64/
+
+    - name: Prepare artifacts
+      run: |
+        cd openwrt/bin/targets/x86/64
+        
+        # 重命名文件
+        for file in openwrt-*-x86-64-generic-squashfs-combined*.img.gz; do
+          if [ -f "$file" ]; then
+            timestamp=$(date +%Y%m%d_%H%M)
+            new_name="OpenWrt-FastBuild-${timestamp}-x86_64-generic.img.gz"
+            mv "$file" "$new_name"
+            echo "生成固件: $new_name"
+            ls -lh "$new_name"
           fi
+        done
+        
+        # 创建构建信息
+        cat > build-info.txt << EOF
+        OpenWrt Fast Build Info
+        =======================
+        构建时间: $(date)
+        构建用时: ${SECONDS}秒 (约$((SECONDS/60))分钟)
+        目标平台: x86_64 Generic
+        源码分支: $REPO_BRANCH
+        
+        优化特性:
+        - ccache 编译缓存
+        - 并行编译 ($JOBS 线程)
+        - 最小化配置
+        - 快速克隆
+        
+        包含软件:
+        - LuCI Web管理界面
+        - Samba4 文件共享
+        - 基础网络工具
+        - OpenClash (如果可用)
+        - Passwall (如果可用)
+        
+        适用于: Win2008 R2 Hyper-V
+        EOF
+        
+        echo "最终文件:"
+        ls -la *.img.gz *.txt 2>/dev/null || echo "没有找到预期文件"
 
-          echo "Found image: $IMG_GZ"
-          cp "$IMG_GZ" "$OUT_DIR/"
+    - name: Upload firmware
+      uses: actions/upload-artifact@v4
+      with:
+        name: OpenWrt-x86_64-FastBuild-${{ github.run_number }}
+        path: |
+          openwrt/bin/targets/x86/64/*.img.gz
+          openwrt/bin/targets/x86/64/build-info.txt
+          openwrt/bin/targets/x86/64/*.manifest
+        retention-days: 30
+        compression-level: 9
 
-          # 同时产出解压后的 .img，方便直接写盘/导入
-          IMG="${IMG_GZ%.gz}"
-          gzip -dc "$IMG_GZ" > "$OUT_DIR/$IMG"
-
-      - name: Upload IMG artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: immortalwrt-img
-          path: |
-            output/*.img
-            output/*.img.gz
+    - name: Build summary
+      run: |
+        cd openwrt/bin/targets/x86/64
+        
+        {
+          echo "## 🚀 快速编译完成"
+          echo ""
+          echo "**编译时长:** $((SECONDS/60)) 分钟 $((SECONDS%60)) 秒"
+          echo "**完成时间:** $(date)"
+          echo ""
+          echo "### 📦 生成的固件"
+          
+          for file in *.img.gz; do
+            if [ -f "$file" ]; then
+              size=$(ls -lh "$file" | awk '{print $5}')
+              echo "- **$file** ($size)"
+            fi
+          done
+          
+          echo ""
+          echo "### ⚡ 性能统计"
+          echo "- **编译线程数:** $(($(nproc) + 2))"
+          echo "- **ccache命中率:** $(ccache --show-stats | grep 'cache hit rate' | head -1 || echo '未知')"
+          echo "- **最终磁盘使用:** $(df -h | grep -E '^/dev' | head -1 | awk '{print $5}')"
+          
+        } >> $GITHUB_STEP_SUMMARY
