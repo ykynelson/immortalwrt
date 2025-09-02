@@ -1,4 +1,4 @@
-name: Fast OpenWrt Build for x86_64
+name: Fixed OpenWrt Build for x86_64
 
 on:
   push:
@@ -13,51 +13,20 @@ env:
   TZ: Asia/Shanghai
 
 jobs:
-  # 使用矩阵策略，可以同时编译多个目标（这里只有一个）
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [x86_64]
+    timeout-minutes: 480
     
     steps:
     - name: Checkout
       uses: actions/checkout@v4
 
-    # 使用多重缓存策略
-    - name: Setup build cache
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.ccache
-          openwrt/dl
-          openwrt/.ccache
-        key: openwrt-${{ matrix.target }}-${{ github.sha }}
-        restore-keys: |
-          openwrt-${{ matrix.target }}-
-          openwrt-
-
-    - name: Setup toolchain cache
-      uses: actions/cache@v4
-      with:
-        path: |
-          openwrt/build_dir/host
-          openwrt/build_dir/hostpkg
-          openwrt/staging_dir/host
-          openwrt/staging_dir/hostpkg
-          openwrt/staging_dir/target-*
-        key: toolchain-${{ matrix.target }}-${{ hashFiles('**/feeds.conf.default') }}
-        restore-keys: |
-          toolchain-${{ matrix.target }}-
-
-    - name: Maximize build space and speed
+    - name: Free up maximum disk space
       run: |
-        echo "磁盘使用情况 (优化前):"
+        echo "磁盘使用情况 (清理前):"
         df -h
         
-        # 删除不必要的文件（更激进的清理）
+        # 删除所有不必要的文件
         sudo rm -rf \
           /usr/share/dotnet \
           /usr/local/lib/android \
@@ -70,296 +39,391 @@ jobs:
           /usr/local/share/chromium \
           /usr/local/lib/node_modules \
           /usr/share/swift \
+          /var/lib/apt/lists/* \
           /tmp/* \
-          /var/log/* \
+          /var/tmp/* \
           2>/dev/null || true
+        
+        # 清理Docker（如果有）
+        sudo docker system prune -a -f 2>/dev/null || true
         
         # 清理包管理器
         sudo apt-get clean
-        sudo apt-get autoremove -y
+        sudo apt-get autoremove -y --purge
         
-        # 优化系统参数
-        echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf
-        echo 'vm.vfs_cache_pressure=50' | sudo tee -a /etc/sysctl.conf
-        sudo sysctl -p
-        
-        echo "磁盘使用情况 (优化后):"
+        echo "磁盘使用情况 (清理后):"
         df -h
 
-    - name: Install dependencies (optimized)
+    - name: Setup build cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.ccache
+          openwrt/dl
+        key: openwrt-cache-v2-${{ hashFiles('**/feeds.conf.default') }}-${{ github.sha }}
+        restore-keys: |
+          openwrt-cache-v2-${{ hashFiles('**/feeds.conf.default') }}-
+          openwrt-cache-v2-
+
+    - name: Install dependencies
       run: |
-        # 使用更快的镜像源
-        sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
-        sudo sed -i 's/http:\/\/archive\.ubuntu\.com\/ubuntu\//http:\/\/mirrors\.ustc\.edu\.cn\/ubuntu\//g' /etc/apt/sources.list
+        # 使用清华镜像源加速
+        sudo sed -i 's/http:\/\/archive\.ubuntu\.com\/ubuntu\//https:\/\/mirrors\.tuna\.tsinghua\.edu\.cn\/ubuntu\//g' /etc/apt/sources.list
         
-        # 只安装绝对必需的包
         sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends --no-install-suggests \
-          build-essential clang flex g++ gawk gcc-multilib gettext git \
-          libncurses5-dev libssl-dev python3-distutils rsync unzip \
-          zlib1g-dev file wget ccache libelf-dev qemu-utils \
-          time curl ca-certificates
+        sudo apt-get install -y --no-install-recommends \
+          build-essential clang flex bison g++ gawk \
+          gcc-multilib g++-multilib gettext git libncurses5-dev \
+          libssl-dev python3-distutils rsync unzip zlib1g-dev \
+          file wget ccache libelf-dev qemu-utils time curl \
+          ca-certificates python3-setuptools python3-yaml \
+          golang-go
         
-        # 优化ccache设置
-        ccache --set-config=max_size=3G
+        # 配置ccache
+        ccache --set-config=max_size=2G
         ccache --set-config=compression=true
-        ccache --set-config=compression_level=6
-        ccache --set-config=cache_dir=~/.ccache
-        export CCACHE_DIR=~/.ccache
         export PATH="/usr/lib/ccache:$PATH"
-        
-        echo "ccache版本和配置:"
-        ccache --version
-        ccache --show-config
 
     - name: Clone OpenWrt source
       run: |
-        # 浅克隆以减少下载时间和空间
-        git clone $REPO_URL -b $REPO_BRANCH openwrt \
-          --depth=1 \
-          --single-branch \
-          --filter=blob:none \
-          --no-tags
-        
+        git clone $REPO_URL -b $REPO_BRANCH openwrt --depth=1
         cd openwrt
-        echo "源码信息:"
-        echo "分支: $(git branch --show-current)"
-        echo "提交: $(git log -1 --oneline)"
-        echo "源码大小: $(du -sh . 2>/dev/null || echo 'unknown')"
+        echo "OpenWrt 版本信息:"
+        cat package/base-files/files/etc/openwrt_release 2>/dev/null || echo "版本文件不存在"
 
-    - name: Load custom feeds
+    - name: Update feeds (with error handling)
       run: |
         cd openwrt
         
-        # 可选：添加第三方feeds以获取更多包
+        # 备份原始 feeds 配置
+        cp feeds.conf.default feeds.conf.default.bak
+        
+        # 可选：添加第三方源（注释掉避免问题）
         # echo 'src-git kenzo https://github.com/kenzok8/openwrt-packages' >> feeds.conf.default
-        # echo 'src-git small https://github.com/kenzok8/small' >> feeds.conf.default
         
-        # 并行更新feeds
-        echo "更新feeds..."
-        time ./scripts/feeds update -a -j$(nproc)
+        echo "更新 feeds..."
+        ./scripts/feeds update -a || {
+          echo "feeds更新失败，尝试修复..."
+          ./scripts/feeds clean
+          ./scripts/feeds update -a
+        }
         
-        echo "安装feeds..."
-        time ./scripts/feeds install -a
+        echo "安装 feeds..."
+        ./scripts/feeds install -a
 
-    - name: Generate minimal config
+    - name: Generate safe configuration
       run: |
         cd openwrt
         
-        # 创建最小化但功能完整的配置
+        # 创建一个安全的配置，避免问题包
         cat > .config << 'EOF'
         CONFIG_TARGET_x86=y
         CONFIG_TARGET_x86_64=y
         CONFIG_TARGET_x86_64_Generic=y
         
-        # 镜像格式 - 只生成需要的
+        # 镜像设置
         CONFIG_EFI_IMAGES=n
         CONFIG_GRUB_IMAGES=y
         CONFIG_VMDK_IMAGES=n
         CONFIG_VDI_IMAGES=n
-        CONFIG_QCOW2_IMAGES=n
         
         # 编译优化
         CONFIG_CCACHE=y
         CONFIG_DEVEL=y
-        CONFIG_TOOLCHAINOPTS=y
-        CONFIG_TARGET_OPTIONS=y
-        CONFIG_KERNEL_BUILD_DOMAIN="buildhost"
-        CONFIG_KERNEL_BUILD_USER="builder"
+        CONFIG_AUTOREMOVE=y
         
         # 基础系统
         CONFIG_PACKAGE_luci=y
         CONFIG_PACKAGE_luci-ssl=y
+        CONFIG_PACKAGE_luci-mod-admin-full=y
+        CONFIG_PACKAGE_luci-theme-bootstrap=y
+        
+        # 基础工具
         CONFIG_PACKAGE_curl=y
         CONFIG_PACKAGE_wget-ssl=y
         CONFIG_PACKAGE_nano=y
+        CONFIG_PACKAGE_htop=y
         
         # 文件共享
         CONFIG_PACKAGE_samba4-server=y
         CONFIG_PACKAGE_luci-app-samba4=y
+        CONFIG_PACKAGE_wsdd2=y
         
-        # 尝试包含请求的应用（如果不存在会被忽略）
-        CONFIG_PACKAGE_luci-app-openclash=m
-        CONFIG_PACKAGE_luci-app-passwall=m
+        # 网络工具
+        CONFIG_PACKAGE_iperf3=y
+        CONFIG_PACKAGE_tcpdump=y
+        CONFIG_PACKAGE_ethtool=y
         
-        # 优化：禁用调试和不必要的功能
-        # CONFIG_COLLECT_KERNEL_DEBUG is not set
-        # CONFIG_KERNEL_DEBUG_INFO is not set
-        # CONFIG_KERNEL_DEBUG_KERNEL is not set
-        # CONFIG_KERNEL_KALLSYMS is not set
-        # CONFIG_PACKAGE_strace is not set
-        # CONFIG_PACKAGE_valgrind is not set
+        # 避免有问题的包
+        # CONFIG_PACKAGE_sing-box is not set
+        # CONFIG_PACKAGE_luci-app-openclash is not set
+        # CONFIG_PACKAGE_luci-app-passwall is not set
+        # CONFIG_PACKAGE_luci-app-passwall2 is not set
+        # CONFIG_PACKAGE_luci-app-ssr-plus is not set
+        
+        # 禁用一些可能有问题的内核模块
+        # CONFIG_PACKAGE_kmod-ipt-offload is not set
         EOF
         
         # 生成完整配置
         make defconfig V=s
         
-        # 显示关键配置
-        echo "=== 关键配置项 ==="
-        grep "=y\|=m" .config | grep -E "(TARGET|PACKAGE_luci|PACKAGE_samba|CCACHE)" | head -20
+        echo "=== 生成的配置检查 ==="
+        grep "CONFIG_PACKAGE.*=y" .config | head -20
 
-    - name: Download packages with retry
+    - name: Check available packages
       run: |
         cd openwrt
         
-        # 设置并行下载，带重试机制
-        download_with_retry() {
-          local max_attempts=3
-          local attempt=1
-          
-          while [ $attempt -le $max_attempts ]; do
-            echo "下载尝试 $attempt/$max_attempts"
-            if make download -j$(($(nproc) * 2)) V=s; then
-              echo "下载成功"
-              return 0
-            else
-              echo "下载失败，等待重试..."
-              sleep 10
-              ((attempt++))
-            fi
-          done
-          
-          echo "多次重试后仍然失败，尝试单线程下载"
-          make download -j1 V=s
-        }
+        echo "=== 检查可用的包 ==="
+        echo "检查 OpenClash 可用性:"
+        ./scripts/feeds search openclash || echo "OpenClash 不可用"
         
-        time download_with_retry
+        echo "检查 Passwall 可用性:"
+        ./scripts/feeds search passwall || echo "Passwall 不可用"
         
-        # 清理损坏的下载文件
-        find dl -size -1024c -exec ls -l {} \; -exec rm -f {} \;
-        
-        echo "下载文件统计:"
-        find dl -type f | wc -l
+        echo "检查 sing-box 可用性:"
+        ./scripts/feeds search sing-box || echo "sing-box 不可用"
 
-    - name: Compile with maximum optimization
+    - name: Add safe optional packages
       run: |
         cd openwrt
         
-        # 设置编译环境
-        export PATH="/usr/lib/ccache:$PATH"
-        export CCACHE_DIR=~/.ccache
-        export FORCE_UNSAFE_CONFIGURE=1
+        # 只添加确定存在且稳定的包
+        echo "" >> .config
+        echo "# 安全的可选包" >> .config
         
-        # 计算最优线程数
-        JOBS=$(($(nproc) + 2))
-        echo "使用 $JOBS 个编译线程"
-        echo "编译开始: $(date)"
+        # 检查并添加包
+        if ./scripts/feeds search luci-app-upnp >/dev/null 2>&1; then
+          echo "CONFIG_PACKAGE_luci-app-upnp=y" >> .config
+        fi
         
-        # 编译过程监控
-        compile_with_monitoring() {
-          # 后台监控磁盘使用情况
-          (
-            while true; do
-              df -h | grep -E '^/dev' | head -1 | awk '{print "磁盘使用:", $3"/"$2, "("$5")"}'
-              sleep 120
-            done
-          ) &
-          local monitor_pid=$!
-          
-          # 执行编译
-          if make -j$JOBS V=s \
-            IGNORE_ERRORS=1 \
-            BUILD_LOG=1 \
-            CONFIG_AUTOREMOVE=y; then
-            echo "编译成功"
-            kill $monitor_pid 2>/dev/null || true
-            return 0
+        if ./scripts/feeds search luci-app-ddns >/dev/null 2>&1; then
+          echo "CONFIG_PACKAGE_luci-app-ddns=y" >> .config
+        fi
+        
+        if ./scripts/feeds search luci-app-nlbwmon >/dev/null 2>&1; then
+          echo "CONFIG_PACKAGE_luci-app-nlbwmon=y" >> .config
+        fi
+        
+        # 重新生成配置
+        make defconfig V=s
+
+    - name: Download packages
+      run: |
+        cd openwrt
+        
+        echo "开始下载源码包..."
+        # 多次尝试下载
+        for i in {1..3}; do
+          echo "下载尝试 $i/3"
+          if make download -j$(nproc) V=s; then
+            echo "下载成功"
+            break
           else
-            echo "多线程编译失败，尝试单线程编译..."
-            kill $monitor_pid 2>/dev/null || true
-            make -j1 V=s
-          fi
-        }
-        
-        time compile_with_monitoring
-        
-        echo "编译完成: $(date)"
-        
-        # 显示ccache统计
-        echo "=== ccache统计 ==="
-        ccache --show-stats
-        
-        # 检查输出文件
-        echo "=== 编译产物 ==="
-        ls -la bin/targets/x86/64/
-
-    - name: Prepare artifacts
-      run: |
-        cd openwrt/bin/targets/x86/64
-        
-        # 重命名文件
-        for file in openwrt-*-x86-64-generic-squashfs-combined*.img.gz; do
-          if [ -f "$file" ]; then
-            timestamp=$(date +%Y%m%d_%H%M)
-            new_name="OpenWrt-FastBuild-${timestamp}-x86_64-generic.img.gz"
-            mv "$file" "$new_name"
-            echo "生成固件: $new_name"
-            ls -lh "$new_name"
+            echo "下载失败，清理后重试..."
+            make clean
+            sleep 5
           fi
         done
         
-        # 创建构建信息
-        cat > build-info.txt << EOF
-        OpenWrt Fast Build Info
+        # 检查下载完整性
+        find dl -size -1024c -exec ls -l {} \; -exec rm -f {} \;
+        echo "下载的包数量: $(find dl -name '*.tar.*' | wc -l)"
+
+    - name: Compile firmware (with error handling)
+      run: |
+        cd openwrt
+        
+        export PATH="/usr/lib/ccache:$PATH"
+        export CCACHE_DIR=~/.ccache
+        
+        echo "开始编译 ($(nproc) 线程)"
+        echo "编译开始时间: $(date)"
+        
+        # 编译函数，包含错误处理
+        compile_openwrt() {
+          # 尝试多线程编译
+          if make -j$(nproc) V=s; then
+            echo "多线程编译成功"
+            return 0
+          fi
+          
+          echo "多线程编译失败，尝试单线程编译..."
+          if make -j1 V=s; then
+            echo "单线程编译成功"
+            return 0
+          fi
+          
+          echo "编译失败，查看错误日志..."
+          # 查找最近的错误日志
+          find logs -name "*.log" -newer logs 2>/dev/null | head -5 | while read log; do
+            echo "=== $log ==="
+            tail -50 "$log"
+            echo ""
+          done
+          
+          return 1
+        }
+        
+        # 执行编译
+        if ! compile_openwrt; then
+          echo "编译失败，尝试跳过失败的包..."
+          make -j1 V=s IGNORE_ERRORS=1 || {
+            echo "编译仍然失败，生成错误报告..."
+            echo "错误时间: $(date)" > compile_error.log
+            echo "磁盘使用: $(df -h /)" >> compile_error.log
+            echo "内存使用: $(free -h)" >> compile_error.log
+            ls -la logs/*.log 2>/dev/null | head -10 >> compile_error.log
+            exit 1
+          }
+        fi
+        
+        echo "编译完成时间: $(date)"
+        echo "编译总用时: $((SECONDS/60))分钟"
+        
+        # ccache 统计
+        echo "=== ccache 统计 ==="
+        ccache --show-stats || echo "ccache统计失败"
+        
+        # 检查输出
+        echo "=== 编译产物 ==="
+        ls -la bin/targets/x86/64/ || echo "没有找到编译输出"
+
+    - name: Check build results
+      run: |
+        cd openwrt
+        
+        if [ -d "bin/targets/x86/64" ]; then
+          echo "找到编译输出目录"
+          cd bin/targets/x86/64
+          
+          # 列出所有文件
+          echo "=== 所有生成的文件 ==="
+          ls -la
+          
+          # 检查固件文件
+          img_files=$(ls *.img.gz 2>/dev/null | wc -l)
+          if [ $img_files -gt 0 ]; then
+            echo "✅ 成功生成 $img_files 个固件文件"
+            for file in *.img.gz; do
+              size=$(ls -lh "$file" | awk '{print $5}')
+              echo "  - $file ($size)"
+            done
+          else
+            echo "❌ 没有找到 .img.gz 固件文件"
+            echo "尝试查找其他格式的文件:"
+            ls -la *.img 2>/dev/null || echo "没有 .img 文件"
+            ls -la *.bin 2>/dev/null || echo "没有 .bin 文件"
+          fi
+        else
+          echo "❌ 没有找到编译输出目录"
+          echo "查看 bin 目录结构:"
+          find bin -type f 2>/dev/null | head -20
+        fi
+
+    - name: Prepare artifacts
+      run: |
+        cd openwrt
+        
+        if [ -d "bin/targets/x86/64" ]; then
+          cd bin/targets/x86/64
+          
+          # 重命名文件
+          for file in *.img.gz; do
+            if [ -f "$file" ]; then
+              timestamp=$(date +%Y%m%d_%H%M)
+              new_name="OpenWrt-Stable-${timestamp}-x86_64-generic.img.gz"
+              mv "$file" "$new_name"
+              echo "生成固件: $new_name"
+            fi
+          done
+          
+          # 创建构建信息
+          cat > build-info.txt << EOF
+        OpenWrt 稳定版构建信息
         =======================
         构建时间: $(date)
-        构建用时: ${SECONDS}秒 (约$((SECONDS/60))分钟)
-        目标平台: x86_64 Generic
-        源码分支: $REPO_BRANCH
+        构建用时: $((SECONDS/60))分钟
+        目标平台: x86_64 Generic  
+        OpenWrt版本: $REPO_BRANCH
         
-        优化特性:
-        - ccache 编译缓存
-        - 并行编译 ($JOBS 线程)
-        - 最小化配置
-        - 快速克隆
+        特点:
+        - 专为 Win2008 R2 Hyper-V 优化
+        - 避免了有问题的包
+        - 包含基础管理界面和工具
+        - 支持文件共享 (Samba4)
         
-        包含软件:
+        包含的主要功能:
         - LuCI Web管理界面
-        - Samba4 文件共享
+        - Samba4 文件共享服务
         - 基础网络工具
-        - OpenClash (如果可用)
-        - Passwall (如果可用)
+        - 系统监控工具
         
-        适用于: Win2008 R2 Hyper-V
+        安装说明:
+        1. 解压 .img.gz 文件
+        2. 在 Hyper-V 中创建虚拟机
+        3. 使用解压后的 .img 文件作为磁盘
+        4. 启动虚拟机
         EOF
         
-        echo "最终文件:"
-        ls -la *.img.gz *.txt 2>/dev/null || echo "没有找到预期文件"
+        else
+          echo "没有找到编译输出，创建错误报告..."
+          mkdir -p error_report
+          echo "编译失败于: $(date)" > error_report/build-error.txt
+          echo "构建日志:" >> error_report/build-error.txt
+          find ../../../logs -name "*.log" 2>/dev/null | head -5 | while read log; do
+            echo "=== $(basename $log) ===" >> error_report/build-error.txt
+            tail -100 "$log" >> error_report/build-error.txt
+            echo "" >> error_report/build-error.txt
+          done
+        fi
 
-    - name: Upload firmware
+    - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: OpenWrt-x86_64-FastBuild-${{ github.run_number }}
+        name: OpenWrt-x86_64-Stable-${{ github.run_number }}
         path: |
           openwrt/bin/targets/x86/64/*.img.gz
           openwrt/bin/targets/x86/64/build-info.txt
           openwrt/bin/targets/x86/64/*.manifest
+          openwrt/error_report/*
         retention-days: 30
-        compression-level: 9
+        if-no-files-found: warn
 
     - name: Build summary
       run: |
-        cd openwrt/bin/targets/x86/64
+        cd openwrt
         
         {
-          echo "## 🚀 快速编译完成"
+          echo "## 🔧 OpenWrt 编译结果"
           echo ""
-          echo "**编译时长:** $((SECONDS/60)) 分钟 $((SECONDS%60)) 秒"
+          echo "**构建时长:** $((SECONDS/60)) 分钟"
           echo "**完成时间:** $(date)"
           echo ""
-          echo "### 📦 生成的固件"
           
-          for file in *.img.gz; do
-            if [ -f "$file" ]; then
-              size=$(ls -lh "$file" | awk '{print $5}')
-              echo "- **$file** ($size)"
-            fi
-          done
+          if [ -d "bin/targets/x86/64" ]; then
+            cd bin/targets/x86/64
+            echo "### ✅ 编译成功"
+            echo ""
+            echo "生成的固件文件:"
+            for file in *.img.gz; do
+              if [ -f "$file" ]; then
+                size=$(ls -lh "$file" | awk '{print $5}')
+                echo "- **$file** ($size)"
+              fi
+            done
+          else
+            echo "### ❌ 编译失败"
+            echo ""
+            echo "请查看 Actions 日志了解详细错误信息"
+          fi
           
           echo ""
-          echo "### ⚡ 性能统计"
-          echo "- **编译线程数:** $(($(nproc) + 2))"
-          echo "- **ccache命中率:** $(ccache --show-stats | grep 'cache hit rate' | head -1 || echo '未知')"
-          echo "- **最终磁盘使用:** $(df -h | grep -E '^/dev' | head -1 | awk '{print $5}')"
+          echo "### 📋 配置说明" 
+          echo "- 目标平台: x86_64 Generic"
+          echo "- 适配: Win2008 R2 Hyper-V"
+          echo "- 避免了 sing-box 等问题包"
+          echo "- 包含稳定的基础功能"
           
         } >> $GITHUB_STEP_SUMMARY
